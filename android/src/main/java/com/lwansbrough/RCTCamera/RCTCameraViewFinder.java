@@ -31,6 +31,10 @@ import com.google.zxing.PlanarYUVLuminanceSource;
 import com.google.zxing.Result;
 import com.google.zxing.ResultPoint;
 import com.google.zxing.common.HybridBinarizer;
+import com.google.zxing.common.GlobalHistogramBinarizer;
+import com.google.zxing.NotFoundException;
+import com.zbar.lib.ZbarManager;
+import android.util.Log;
 
 class RCTCameraViewFinder extends TextureView implements TextureView.SurfaceTextureListener, Camera.PreviewCallback {
     private int _cameraType;
@@ -43,6 +47,8 @@ class RCTCameraViewFinder extends TextureView implements TextureView.SurfaceText
     private Camera _camera;
     private float mFingerSpacing;
 
+    private final ZbarManager mZarBarManager;
+
     // concurrency lock for barcode scanner to avoid flooding the runtime
     public static volatile boolean barcodeScannerTaskLock = false;
 
@@ -54,6 +60,7 @@ class RCTCameraViewFinder extends TextureView implements TextureView.SurfaceText
         this.setSurfaceTextureListener(this);
         this._cameraType = type;
         this.initBarcodeReader(RCTCamera.getInstance().getBarCodeTypes());
+        mZarBarManager = new ZbarManager();
     }
 
     @Override
@@ -291,6 +298,42 @@ class RCTCameraViewFinder extends TextureView implements TextureView.SurfaceText
         }
     }
 
+    private PlanarYUVLuminanceSource generateLuminanceSource(byte[] imageData, int width, int height) {
+      int tX = width / 5;
+      int tY = height / 4;
+      int tXW = tX * 3;
+      int tYW = tY * 2;
+      PlanarYUVLuminanceSource source = new PlanarYUVLuminanceSource(
+          imageData, // byte[] yuvData
+          width, // int dataWidth
+          height, // int dataHeight
+          tX, // int left
+          tY, // int top
+          tXW, // int width
+          tYW, // int height
+          false // boolean reverseHorizontal
+      );
+      return source;
+    }
+
+    private Result getQRByZbar(byte[] imageData, int width, int height) {
+      int tX = width / 5;
+      int tY = height / 4;
+      int tXW = tX * 3;
+      int tYW = tY * 2;
+  
+      Result result = null;
+      PlanarYUVLuminanceSource source = generateLuminanceSource(imageData, width, height);
+      String stringResult = mZarBarManager.decode(source.getMatrix(), tXW, tYW, false, 0, 0, tXW, tYW);
+      if (stringResult != null) {
+        byte[] fakeYuvData = new byte[10];
+        ResultPoint[] fakePoints = new ResultPoint[10];
+        result = new Result(stringResult, fakeYuvData, fakePoints, BarcodeFormat.QR_CODE);
+      }
+      Log.d("codingpapi", "recognize with zbar result:" + result);
+      return result;
+    }
+
     private class ReaderAsyncTask extends AsyncTask<Void, Void, Void> {
         private byte[] imageData;
         private final Camera camera;
@@ -324,36 +367,46 @@ class RCTCameraViewFinder extends TextureView implements TextureView.SurfaceText
                 imageData = rotated;
             }
 
+            Result result = null;
+
             try {
-                PlanarYUVLuminanceSource source = new PlanarYUVLuminanceSource(imageData, width, height, 0, 0, width, height, false);
-                BinaryBitmap bitmap = new BinaryBitmap(new HybridBinarizer(source));
-                Result result = _multiFormatReader.decodeWithState(bitmap);
-
-                ReactContext reactContext = RCTCameraModule.getReactContextSingleton();
-                WritableMap event = Arguments.createMap();
-                WritableArray resultPoints = Arguments.createArray();
-                ResultPoint[] points = result.getResultPoints();
-                if(points != null) {
-                    for (ResultPoint point : points) {
-                        WritableMap newPoint = Arguments.createMap();
-                        newPoint.putString("x", String.valueOf(point.getX()));
-                        newPoint.putString("y", String.valueOf(point.getY()));
-                        resultPoints.pushMap(newPoint);
-                    }
-                }
-
-                event.putArray("bounds", resultPoints);
-                event.putString("data", result.getText());
-                event.putString("type", result.getBarcodeFormat().toString());
-                reactContext.getJSModule(DeviceEventManagerModule.RCTDeviceEventEmitter.class).emit("CameraBarCodeReadAndroid", event);
-
+              PlanarYUVLuminanceSource source = generateLuminanceSource(imageData, width, height);
+              BinaryBitmap bitmap = new BinaryBitmap(new GlobalHistogramBinarizer(source));
+              result = _multiFormatReader.decodeWithState(bitmap);
+              Log.d("codingpapi", "recognize with zxing result:" + result);
+              if (result == null) {
+                result = getQRByZbar(imageData, width, height);
+              }
+            } catch (NotFoundException e) {
+              result = getQRByZbar(imageData, width, height);
+              // No barcode found, result is already null.
             } catch (Throwable t) {
-                // meh
-            } finally {
-                _multiFormatReader.reset();
-                RCTCameraViewFinder.barcodeScannerTaskLock = false;
-                return null;
+              t.printStackTrace();
             }
+
+
+            if (result != null) {
+              ReactContext reactContext = RCTCameraModule.getReactContextSingleton();
+              WritableMap event = Arguments.createMap();
+
+              event.putString("data", result.getText());
+              event.putString("type", result.getBarcodeFormat().toString());
+              WritableArray resultPoints = Arguments.createArray();
+              ResultPoint[] points = result.getResultPoints();
+              for (ResultPoint point: points) {
+                if(point!=null) {
+                  WritableMap newPoint = Arguments.createMap();
+                  newPoint.putString("x", String.valueOf(point.getX()));
+                  newPoint.putString("y", String.valueOf(point.getY()));
+                  resultPoints.pushMap(newPoint);
+                }
+              }
+              event.putArray("bounds",resultPoints);
+              reactContext.getJSModule(DeviceEventManagerModule.RCTDeviceEventEmitter.class).emit("CameraBarCodeReadAndroid", event);
+            }
+            _multiFormatReader.reset();
+            RCTCameraViewFinder.barcodeScannerTaskLock = false;
+            return null;
         }
     }
 
